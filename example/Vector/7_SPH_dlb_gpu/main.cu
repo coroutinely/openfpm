@@ -213,7 +213,7 @@ inline void EqState(particles & vd)
 	// You can use standard CUDA kernel launch or the macro CUDA_LAUNCH
 
 	//EqState_gpuning<<<it.wthr,it.thr>>>(vd.toKernel(),B);
-	CUDA_LAUNCH(EqState_gpu,it,vd.toKernel(),B)
+	CUDA_LAUNCH(EqState_gpu,it,vd.toKernel(),B);
 }
 
 
@@ -342,7 +342,7 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 
 		// If it is a boundary particle calculate the delta rho based on equation 2
 		// This require to run across the neighborhoods particles of a
-		auto Np = NN.getNNIterator(NN.getCell(vd.getPos(a)));
+		auto Np = NN.getNNIteratorBoxSym(a, NN.getCell(vd.getPos(a)));
 
 		// For each neighborhood particle
 		while (Np.isNext() == true)
@@ -368,6 +368,7 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 
 			// Get the distance between p and q
 			Point<3,real_number> dr = xa - xb;
+			Point<3,real_number> minus_dr = xb - xa;
 			// take the norm of this vector
 			real_number r2 = norm2(dr);
 
@@ -378,15 +379,20 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 				real_number r = sqrt(r2);
 
 				Point<3,real_number> dv = va - vb;
+				Point<3,real_number> minus_dv = vb - va;
 
 				Point<3,real_number> DW;
 				DWab(dr,DW,r,false);
+
+				Point<3,real_number> minus_DW;
+				DWab(minus_dr,minus_DW,r,false);
 
 				const real_number dot = dr.get(0)*dv.get(0) + dr.get(1)*dv.get(1) + dr.get(2)*dv.get(2);
 				const real_number dot_rr2 = dot/(r2+Eta2);
 				max_visc = (dot_rr2 < max_visc)?max_visc:dot_rr2;
 
 				vd.template getProp<drho>(a) += massb*(dv.get(0)*DW.get(0)+dv.get(1)*DW.get(1)+dv.get(2)*DW.get(2));
+				atomicAdd(&vd.template getProp<drho>(b), massa*(minus_dv.get(0)*minus_DW.get(0)+minus_dv.get(1)*minus_DW.get(1)+minus_dv.get(2)*minus_DW.get(2)));
 			}
 
 			++Np;
@@ -399,7 +405,7 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 		// If it is a fluid particle calculate based on equation 1 and 2
 
 		// Get an iterator over the neighborhood particles of p
-		auto Np = NN.getNNIterator(NN.getCell(vd.getPos(a)));
+		auto Np = NN.getNNIteratorBoxSym(a, NN.getCell(vd.getPos(a)));
 
 		// For each neighborhood particle
 		while (Np.isNext() == true)
@@ -420,6 +426,7 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 
 			// Get the distance between p and q
 			Point<3,real_number> dr = xa - xb;
+			Point<3,real_number> minus_dr = xb - xa;
 			// take the norm of this vector
 			real_number r2 = norm2(dr);
 
@@ -428,18 +435,28 @@ __global__ void calc_forces_gpu(particles_type vd, NN_type NN, real_number W_dap
 			{
 				real_number r = sqrt(r2);
 
-				Point<3,real_number> v_rel = va - vb;
+				Point<3,real_number> dv = va - vb;
+				Point<3,real_number> minus_dv = vb - va;
 
 				Point<3,real_number> DW;
 				DWab(dr,DW,r,false);
 
-				real_number factor = - massb*((vd.template getProp<Pressure>(a) + vd.template getProp<Pressure>(b)) / (rhoa * rhob) + Tensile(r,rhoa,rhob,Pa,Pb,W_dap) + Pi(dr,r2,v_rel,rhoa,rhob,massb,cbar,max_visc));
+				Point<3,real_number> minus_DW;
+				DWab(minus_dr,minus_DW,r,false);
+
+				real_number 	  factor = - massb*((vd.template getProp<Pressure>(a) + vd.template getProp<Pressure>(b)) / (rhoa * rhob) + Tensile(r,rhoa,rhob,Pa,Pb,W_dap) + Pi(dr,r2,dv,rhoa,rhob,massb,cbar,max_visc));
+				real_number minus_factor = - massa*((vd.template getProp<Pressure>(a) + vd.template getProp<Pressure>(b)) / (rhoa * rhob) + Tensile(r,rhoa,rhob,Pa,Pb,W_dap) + Pi(minus_dr,r2,minus_dv,rhoa,rhob,massa,cbar,max_visc));
 
 				vd.template getProp<force>(a)[0] += factor * DW.get(0);
 				vd.template getProp<force>(a)[1] += factor * DW.get(1);
 				vd.template getProp<force>(a)[2] += factor * DW.get(2);
 
-				vd.template getProp<drho>(a) += massb*(v_rel.get(0)*DW.get(0)+v_rel.get(1)*DW.get(1)+v_rel.get(2)*DW.get(2));
+				atomicAdd(&vd.template getProp<force>(b)[0], minus_factor * minus_DW.get(0));
+				atomicAdd(&vd.template getProp<force>(b)[1], minus_factor * minus_DW.get(1));
+				atomicAdd(&vd.template getProp<force>(b)[2], minus_factor * minus_DW.get(2));
+
+				vd.template getProp<drho>(a) += massb*(dv.get(0)*DW.get(0)+dv.get(1)*DW.get(1)+dv.get(2)*DW.get(2));
+				atomicAdd(&vd.template getProp<drho>(b), massa*(minus_dv.get(0)*minus_DW.get(0)+minus_dv.get(1)*minus_DW.get(1)+minus_dv.get(2)*minus_DW.get(2)));
 			}
 
 			++Np;
@@ -454,10 +471,10 @@ template<typename CellList> inline void calc_forces(particles & vd, CellList & N
 	auto part = vd.getDomainIteratorGPU(32);
 
 	// Update the cell-list
-	vd.updateCellList(NN);
+	vd.updateCellListGPU(NN);
 
 	//calc_forces_gpu<<<part.wthr,part.thr>>>(vd.toKernel(),NN.toKernel(),W_dap,cbar);
-	CUDA_LAUNCH(calc_forces_gpu,part,vd.toKernel(),NN.toKernel(),W_dap,cbar)
+	CUDA_LAUNCH(calc_forces_gpu,part,vd.toKernel(),NN.toKernel(),W_dap,cbar);
 
 	max_visc = reduce_local<red,_max_>(vd);
 }
@@ -928,7 +945,9 @@ int main(int argc, char* argv[])
 	size_t it = 0;
 	size_t it_reb = 0;
 	real_number t = 0.0;
-	while (t <= t_end)
+	size_t timestep = 0;
+
+	while (timestep < 1000)
 	{
 		Vcluster<> & v_cl = create_vcluster();
 		timer it_time;
@@ -979,13 +998,13 @@ int main(int argc, char* argv[])
 
 		t += dt;
 
-		if (write < t*100)
+		if (timestep % 100 == 0)
 		{
 			// Sensor pressure require update ghost, so we ensure that particles are distributed correctly
 			// and ghost are updated
 			vd.map(RUN_ON_DEVICE);
 			vd.ghost_get<type,rho,Pressure,velocity>(RUN_ON_DEVICE);
-			vd.updateCellList(NN);
+			vd.updateCellListGPU(NN);
 
 			// calculate the pressure at the sensor points
 			//sensor_pressure(vd,NN,press_t,probes);
@@ -1003,11 +1022,12 @@ int main(int argc, char* argv[])
 			if (v_cl.getProcessUnitID() == 0)
 			{std::cout << "TIME: " << t << "  write " << it_time.getwct() << "   " << it_reb << "   " << cnt << " Max visc: " << max_visc << "   " << vd.size_local()  << std::endl;}
 		}
-		else
-		{
-			if (v_cl.getProcessUnitID() == 0)
-			{std::cout << "TIME: " << t << "  " << it_time.getwct() << "   " << it_reb << "   " << cnt  << " Max visc: " << max_visc << "   " << vd.size_local() << std::endl;}
-		}
+		//else
+		//{
+		//	if (v_cl.getProcessUnitID() == 0)
+		//	{std::cout << "TIME: " << t << "  " << it_time.getwct() << "   " << it_reb << "   " << cnt  << " Max visc: " << max_visc << "   " << vd.size_local() << std::endl;}
+		//}
+		++timestep;
 	}
 
 	tot_sim.stop();
