@@ -78,7 +78,7 @@
 #include "timer.hpp"
 
 #ifdef TEST_RUN
-size_t nstep = 1;
+size_t nstep = 0;
 #else
 size_t nstep = 1000;
 #endif
@@ -93,7 +93,7 @@ constexpr int energy = 2;
 
 //! \cond [calculate_force_kernel] \endcond
 template<typename vector_dist_type,typename NN_type>
-__global__ void pre_calc_force_gpu(vector_dist_type vd, NN_type NN, real_number sigma12, real_number sigma6, real_number r_cut2)
+__global__ void pre_calc_force_gpu(vector_dist_type vd, NN_type NN)
 {
 	auto p = GET_PARTICLE(vd);
 
@@ -112,8 +112,8 @@ __global__ void calc_force_gpu(vector_dist_type vd, NN_type NN, real_number sigm
 	Point<3,real_number> xp = vd.getPos(p);
 
 	// Get an iterator over the neighborhood particles of p
-	//auto Np = NN.getNNIteratorBoxSym(p, NN.getCell(vd.getPos(p)));
-	auto Np = NN.getNNIteratorBox(NN.getCell(vd.getPos(p)));
+	auto Np = NN.getNNIteratorBoxSym(p, NN.getCell(vd.getPos(p)));
+	//auto Np = NN.getNNIteratorBox(NN.getCell(vd.getPos(p)));
 	// For each neighborhood particle ...
 	while (Np.isNext())
 	{
@@ -139,8 +139,13 @@ __global__ void calc_force_gpu(vector_dist_type vd, NN_type NN, real_number sigm
 		Point<3,real_number> f = 24.0*(2.0 *sigma12 / (rn*rn*rn*rn*rn*rn*rn) -  sigma6 / (rn*rn*rn*rn)) * r;
 
 		// we sum the force produced by q on p
-		atomicAdd(&vd.template getProp<force>(p)[0], 1);
-		//atomicAdd(&vd.template getProp<force>(p)[1], 1);
+		//vd.template getProp<force>(p)[0] = q;
+		atomicAdd(&vd.template getProp<force>(p)[1], 1);
+		atomicAdd(&vd.template getProp<force>(q)[1], 1);
+
+		//if (abs(xq[0] < 1e-5) && abs(xq[1] < 1e-5) && abs(xq[2] < 1e-5)) {
+		printf("%d (%f %f %f) %d (%f %f %f) %f\n", p, xp[0], xp[1], xp[2], q, xq[0], xq[1], xq[2], vd.template getProp<force>(q)[1]);
+		//}
 		//atomicAdd(&vd.template getProp<force>(p)[2], 1);
 
 		//atomicAdd(&vd.template getProp<force>(q)[0], 1);
@@ -252,12 +257,14 @@ template<typename CellList> void calc_forces(vector_dist_gpu<3,real_number, aggr
     }
 	std::cout << std::endl;
 	std::cout << "Total elemenets: " << NelementsSum << std::endl;
+
 #if 0
 	std::cout << "numPartInCell :" << NN.numPartInCell.size() << std::endl;
 	for (int i = 0; i < NN.numPartInCell.size(); i++) {
 		std::cout << "[" << i << ": " << NN.numPartInCell.template get<0>(i) << "] ";
 	}
 	std::cout << std::endl;
+
 
 	std::cout << "numPartInCellPrefix :" << NN.numPartInCellPrefixSum.size() << std::endl;
 	for (int i = 0; i < NN.numPartInCellPrefixSum.size(); i++) {
@@ -280,19 +287,22 @@ template<typename CellList> void calc_forces(vector_dist_gpu<3,real_number, aggr
 	std::cout << std::endl;
 	
 	// Get an iterator over particles
-	auto it2 = vd.getDomainIteratorGPU();
+	auto itd = vd.getDomainIteratorGPU();
+	auto itdg = vd.getDomainAndGhostIteratorGPU();
 
-	CUDA_LAUNCH(pre_calc_force_gpu,it2,vd.toKernel(),NN.toKernel(),sigma12,sigma6,r_cut2);
-	CUDA_LAUNCH(calc_force_gpu,it2,vd.toKernel(),NN.toKernel(),sigma12,sigma6,r_cut2);
-
+	CUDA_LAUNCH(pre_calc_force_gpu,itdg,vd.toKernel(),NN.toKernel());
+	CUDA_LAUNCH(calc_force_gpu,itd,vd.toKernel(),NN.toKernel(),sigma12,sigma6,r_cut2);
+	
+	vd.ghost_put<add_,force>(RUN_ON_DEVICE);
 	vd.template deviceToHostProp<velocity, force, energy>();
-    auto vd_it = vd.getDomainIterator();
+	vd.template deviceToHostPos();
+    auto vd_it = vd.getDomainAndGhostIterator();
     while (vd_it.isNext()) {
         auto key = vd_it.get();
-        std::cout << "(" << vd.getPos(key)[0] << " " << vd.getPos(key)[1] << " " << vd.getProp<0>(key)[2] << ") ";
-		std::cout << "(" << vd.getProp<velocity>(key)[0] << " " << vd.getProp<velocity>(key)[1] << " " << vd.getProp<velocity>(key)[2] << ") ";
+        std::cout << "(" << vd.getPos(key)[0] << " " << vd.getPos(key)[1] << " " << vd.getPos(key)[2] << ") ";
+		//std::cout << "(" << vd.getProp<velocity>(key)[0] << " " << vd.getProp<velocity>(key)[1] << " " << vd.getProp<velocity>(key)[2] << ") ";
 		std::cout << "(" << vd.getProp<force>(key)[0] << " " << vd.getProp<force>(key)[1] << " " << vd.getProp<force>(key)[2] << ") ";
-		std::cout << "{" << vd.getProp<energy>(key) << "} ";
+		//std::cout << "{" << vd.getProp<energy>(key) << "} ";
 		std::cout << std::endl;
         ++vd_it;
     }
@@ -324,14 +334,15 @@ int main(int argc, char* argv[])
 	openfpm_init(&argc,&argv);
 
 	real_number sigma = 0.01;
-	real_number r_cut = 3.0*sigma;
+	real_number r_cut = 3 * sigma;
 
 	// we will use it do place particles on a 10x10x10 Grid like
-	size_t sz[3] = {100/50,100/50,100/50};
+	int N = 3;
+	size_t sz[3] = {N, N, N};
 
 	// domain
-	Box<3,float> box({0.0,0.0,0.0},{1.0/50,1.0/50,1.0/50});
-
+	//Box<3,float> box({0.0,0.0,0.0}, {(N+1)*r_cut, (N+1)*r_cut, (N+1)*r_cut});
+	Box<3,float> box({0.0,0.0,0.0}, {(N-1)*r_cut, (N-1)*r_cut, (N-1)*r_cut});
 	// Boundary conditions
 	size_t bc[3]={PERIODIC,PERIODIC,PERIODIC};
 
